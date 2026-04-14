@@ -305,19 +305,52 @@ function ensureMcpForClaude(
 const CODEX_CONFIG_DIR = path.join(os.homedir(), ".codex");
 const CODEX_CONFIG_FILE = path.join(CODEX_CONFIG_DIR, "config.toml");
 
+function buildCodexMcpServerBlock(
+  name: string,
+  cfg: Record<string, unknown>,
+): string {
+  const lines = [`[mcp_servers.${name}]`];
+  if (cfg.type === "stdio") {
+    lines.push(`command = ${JSON.stringify(String(cfg.command ?? ""))}`);
+    const args = Array.isArray(cfg.args) ? cfg.args : [];
+    lines.push(`args = [${args.map((arg) => JSON.stringify(String(arg))).join(", ")}]`);
+  } else {
+    lines.push(`url = ${JSON.stringify(String(cfg.url ?? ""))}`);
+  }
+  lines.push("enabled = true");
+  return `${lines.join("\n")}\n`;
+}
+
+export function mergeCodexMcpServerIntoToml(
+  raw: string,
+  name: string,
+  cfg: Record<string, unknown>,
+): string {
+  const block = buildCodexMcpServerBlock(name, cfg);
+  const trimmed = raw.trimEnd();
+  const normalized = trimmed.length > 0 ? `${trimmed}\n` : "";
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionPattern = new RegExp(
+    String.raw`^\[mcp_servers\.${escapedName}\]\n[\s\S]*?(?=^\[[^\n]+\]\n|\Z)`,
+    "m",
+  );
+
+  if (sectionPattern.test(normalized)) {
+    return normalized.replace(sectionPattern, block).trimEnd() + "\n";
+  }
+
+  return `${normalized}${normalized.length > 0 ? "\n" : ""}${block}`.trimEnd() + "\n";
+}
+
 async function ensureMcpForCodex(mcpEndpoint: string, customServers: CustomMcpServerConfig[] = []): Promise<McpSetupResult> {
   try {
-    // Read existing config (or start fresh)
-    let existing: Record<string, unknown> = {};
+    // Read existing config as raw text so we never drop unrelated Codex settings.
+    let raw = "";
     try {
-      const raw = await fs.promises.readFile(CODEX_CONFIG_FILE, "utf-8");
-      existing = TOML.parse(raw) as Record<string, unknown>;
+      raw = await fs.promises.readFile(CODEX_CONFIG_FILE, "utf-8");
     } catch {
       // file doesn't exist yet
     }
-
-    // Ensure "mcp_servers" key exists as an object
-    const mcpServers = (existing.mcp_servers ?? {}) as Record<string, unknown>;
 
     // Built-in server
     const builtIn: Record<string, unknown> = {
@@ -325,24 +358,15 @@ async function ensureMcpForCodex(mcpEndpoint: string, customServers: CustomMcpSe
     };
     // Merge custom servers — Codex uses url-based entries with enabled flag
     const merged = mergeCustomMcpServers(builtIn, customServers);
+    let nextConfig = raw;
     for (const [name, cfg] of Object.entries(merged)) {
       const serverCfg = cfg as Record<string, unknown>;
-      if (serverCfg.type === "stdio") {
-        mcpServers[name] = { command: serverCfg.command, args: serverCfg.args ?? [], enabled: true };
-      } else {
-        mcpServers[name] = { url: serverCfg.url, enabled: true };
-      }
+      nextConfig = mergeCodexMcpServerIntoToml(nextConfig, name, serverCfg);
     }
-
-    existing.mcp_servers = mcpServers;
 
     // Write back
     await fs.promises.mkdir(CODEX_CONFIG_DIR, { recursive: true });
-    await fs.promises.writeFile(
-      CODEX_CONFIG_FILE,
-      TOML.stringify(existing as Record<string, unknown>) + "\n",
-      "utf-8",
-    );
+    await fs.promises.writeFile(CODEX_CONFIG_FILE, nextConfig, "utf-8");
 
     console.log(
       `[MCP:Codex] Wrote routa-coordination to ${CODEX_CONFIG_FILE}`,
